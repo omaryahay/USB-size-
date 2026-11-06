@@ -1,0 +1,261 @@
+// ============================================================
+//  USB Storage Guard Advanced — Manager UI
+//  Author : Omar Yahya Silan (عمر يحي سيلان)
+//  UI     : Two buttons only + mandatory password before action
+// ============================================================
+
+using System;
+using System.IO;
+using System.IO.Pipes;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Windows.Forms;
+
+namespace UsbStorageGuardManager
+{
+    internal static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
+        }
+    }
+
+    // ===================== Vault (PBKDF2-SHA256) =====================
+    static class Vault
+    {
+        static readonly byte[] Magic = { (byte)'U', (byte)'S', (byte)'G', (byte)'P' };
+        const byte Version = 1;
+        public const int Iterations = 200_000;
+        public const int SaltSize = 16;
+        public const int HashSize = 32;
+
+        public static string Path => System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "USBStorageGuardAdvanced", "password.dat");
+
+        public static bool Exists => File.Exists(Path);
+
+        public static void Save(string password)
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
+            byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
+            byte[] hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, Iterations, HashAlgorithmName.SHA256, HashSize);
+
+            using var ms = new MemoryStream();
+            ms.Write(Magic, 0, 4);
+            ms.WriteByte(Version);
+            ms.Write(BitConverter.GetBytes(Iterations), 0, 4);
+            ms.WriteByte((byte)salt.Length);
+            ms.Write(salt, 0, salt.Length);
+            ms.WriteByte((byte)hash.Length);
+            ms.Write(hash, 0, hash.Length);
+
+            var tmp = Path + ".tmp";
+            File.WriteAllBytes(tmp, ms.ToArray());
+            File.Move(tmp, Path, overwrite: true);
+        }
+
+        public static bool Verify(string password)
+        {
+            if (!File.Exists(Path)) return false;
+            try
+            {
+                var b = File.ReadAllBytes(Path);
+                if (b.Length < 10 || !b.AsSpan(0, 4).SequenceEqual(Magic)) return false;
+                if (b[4] != Version) return false;
+                int iter = BitConverter.ToInt32(b, 5);
+                int sl = b[9];
+                var salt = b.AsSpan(10, sl).ToArray();
+                int hl = b[10 + sl];
+                var hash = b.AsSpan(11 + sl, hl).ToArray();
+                var actual = Rfc2898DeriveBytes.Pbkdf2(password, salt, iter, HashAlgorithmName.SHA256, hl);
+                return CryptographicOperations.FixedTimeEquals(actual, hash);
+            }
+            catch { return false; }
+        }
+    }
+
+    // ===================== Set Password (first run) =====================
+    class SetPasswordDialog : Form
+    {
+        readonly TextBox p1 = new TextBox { Left = 20, Top = 35, Width = 300, UseSystemPasswordChar = true };
+        readonly TextBox p2 = new TextBox { Left = 20, Top = 75, Width = 300, UseSystemPasswordChar = true };
+        readonly Label err = new Label { Left = 20, Top = 110, Width = 300, ForeColor = System.Drawing.Color.DarkRed };
+
+        public SetPasswordDialog()
+        {
+            RightToLeft = RightToLeft.Yes;
+            RightToLeftLayout = true;
+            Text = "إنشاء كلمة المرور";
+            Width = 360; Height = 210;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+
+            var l1 = new Label { Text = "كلمة المرور الجديدة:", Left = 20, Top = 12, AutoSize = true };
+            var l2 = new Label { Text = "تأكيد كلمة المرور:", Left = 20, Top = 52, AutoSize = true };
+            var ok = new Button { Text = "حفظ", Left = 140, Top = 140, Width = 90 };
+            var cancel = new Button { Text = "خروج", Left = 240, Top = 140, Width = 90, DialogResult = DialogResult.Cancel };
+            AcceptButton = ok; CancelButton = cancel;
+
+            ok.Click += (_, __) =>
+            {
+                if (p1.Text.Length < 8) { err.Text = "8 أحرف على الأقل."; return; }
+                if (p1.Text != p2.Text) { err.Text = "الكلمتان غير متطابقتين."; return; }
+                try { Vault.Save(p1.Text); DialogResult = DialogResult.OK; }
+                catch (Exception ex) { err.Text = "فشل: " + ex.Message; }
+            };
+            Controls.AddRange(new Control[] { l1, p1, l2, p2, err, ok, cancel });
+        }
+    }
+
+    // ===================== Password Prompt (before each action) =====================
+    class PasswordPrompt : Form
+    {
+        public string Password { get; private set; } = "";
+        readonly TextBox box = new TextBox { Left = 20, Top = 45, Width = 300, UseSystemPasswordChar = true };
+
+        public PasswordPrompt(string title)
+        {
+            RightToLeft = RightToLeft.Yes;
+            RightToLeftLayout = true;
+            Text = title;
+            Width = 360; Height = 170;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+
+            var lbl = new Label { Text = "أدخل كلمة المرور:", Left = 20, Top = 15, AutoSize = true };
+            var ok = new Button { Text = "موافق", Left = 140, Top = 85, Width = 90, DialogResult = DialogResult.OK };
+            var cancel = new Button { Text = "إلغاء", Left = 240, Top = 85, Width = 90, DialogResult = DialogResult.Cancel };
+            AcceptButton = ok; CancelButton = cancel;
+            ok.Click += (_, __) => Password = box.Text;
+            Controls.AddRange(new Control[] { lbl, box, ok, cancel });
+        }
+    }
+
+    // ===================== Main Form — Two Buttons + Developer Label =====================
+    class MainForm : Form
+    {
+        Label status = new Label
+        {
+            Left = 20, Top = 20, Width = 400, Height = 50,
+            TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+            Font = new System.Drawing.Font("Segoe UI", 11, System.Drawing.FontStyle.Bold)
+        };
+        Button enableBtn  = new Button { Text = "تفعيل الحماية", Left = 20, Top = 85,  Width = 400, Height = 55, Font = new System.Drawing.Font("Segoe UI", 12) };
+        Button disableBtn = new Button { Text = "إلغاء التفعيل", Left = 20, Top = 155, Width = 400, Height = 55, Font = new System.Drawing.Font("Segoe UI", 12) };
+
+        // ← ← ← Label المطور ← ← ←
+        Label credit = new Label
+        {
+            Text = "المطور: عمر يحي سيلان",
+            Left = 20, Top = 230, Width = 400, Height = 30,
+            TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+            ForeColor = System.Drawing.Color.DarkGreen,
+            Font = new System.Drawing.Font("Segoe UI", 9, System.Drawing.FontStyle.Bold)
+        };
+
+        public MainForm()
+        {
+            RightToLeft = RightToLeft.Yes;
+            RightToLeftLayout = true;
+            Text = "USB Storage Guard Advanced";
+            Width = 460; Height = 320;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            StartPosition = FormStartPosition.CenterScreen;
+
+            enableBtn.Click  += (_, __) => PerformAction(true);
+            disableBtn.Click += (_, __) => PerformAction(false);
+
+            Controls.AddRange(new Control[] { status, enableBtn, disableBtn, credit });
+
+            Shown += (_, __) =>
+            {
+                if (!Vault.Exists)
+                {
+                    using var dlg = new SetPasswordDialog();
+                    if (dlg.ShowDialog(this) != DialogResult.OK)
+                    {
+                        MessageBox.Show("لا يمكن تشغيل البرنامج بدون كلمة مرور.", "تنبيه");
+                        Close();
+                        return;
+                    }
+                }
+                RefreshStatus();
+            };
+        }
+
+        void PerformAction(bool enable)
+        {
+            using var dlg = new PasswordPrompt(enable ? "تأكيد التفعيل" : "تأكيد إلغاء التفعيل");
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            if (!Vault.Verify(dlg.Password))
+            {
+                MessageBox.Show("كلمة المرور غير صحيحة.", "خطأ",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var resp = CallService(enable);
+            if (resp != "OK")
+            {
+                MessageBox.Show("فشل الاتصال بالخدمة: " + resp, "خطأ",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            RefreshStatus();
+        }
+
+        void RefreshStatus()
+        {
+            var resp = CallService(null);
+            if (resp.StartsWith("{\"error\""))
+            {
+                status.Text = "الخدمة غير متاحة. تأكد من تثبيت وتشغيل الخدمة.";
+                enableBtn.Enabled = false;
+                disableBtn.Enabled = false;
+                return;
+            }
+            try
+            {
+                var p = JsonSerializer.Deserialize<PolicyDto>(resp);
+                bool active = p != null && p.Enabled == 1;
+                status.Text = active ? "✔ الحماية مفعّلة — الحد 265 GB" : "✘ الحماية معطّلة";
+                enableBtn.Enabled  = !active;
+                disableBtn.Enabled = active;
+            }
+            catch
+            {
+                status.Text = "خطأ في قراءة الحالة.";
+            }
+        }
+
+        static string CallService(bool? enable)
+        {
+            try
+            {
+                using var pipe = new NamedPipeClientStream(".", "UsbStorageGuard.pipe", PipeDirection.InOut);
+                pipe.Connect(3000);
+                using var w = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
+                using var r = new StreamReader(pipe, Encoding.UTF8);
+                string req = enable.HasValue
+                    ? JsonSerializer.Serialize(new { Op = "set", Enabled = enable.Value ? 1u : 0u, MaxBytes = 265_000_000_000UL })
+                    : JsonSerializer.Serialize(new { Op = "get", Enabled = 0u, MaxBytes = 0UL });
+                w.WriteLine(req);
+                return r.ReadLine() ?? "{\"error\":-1}";
+            }
+            catch (Exception ex) { return $"{{\"error\":{ex.HResult}}}"; }
+        }
+
+        record PolicyDto(uint Enabled, ulong MaxBytes);
+    }
+}
