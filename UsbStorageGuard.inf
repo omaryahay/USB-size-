@@ -1,45 +1,37 @@
 [Version]
-Signature="$WINDOWS NT$"
-Class=System
-ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
-Provider=%Provider%
-DriverVer=11/06/2026,0.1.0.0
-CatalogFile=UsbStorageGuard.cat
-PnpLockdown=1
-
-[Manufacturer]
-%Provider%=Standard,NTamd64
-
-[Standard.NTamd64]
-%DeviceDesc%=UsbStorageGuard_Install, Root\UsbStorageGuard
-
-[UsbStorageGuard_Install]
-CopyFiles=DriverCopy
-
-[DriverCopy]
-UsbStorageGuard.sys
-
-[UsbStorageGuard_Install.Services]
-AddService=UsbStorageGuard,0x00000002,Service_Install
-
-[Service_Install]
-DisplayName=%ServiceName%
-ServiceType=1
-StartType=3
-ErrorControl=1
-ServiceBinary=%12%\UsbStorageGuard.sys
+Signature   = "$Windows NT$"
+Class       = DiskDrive
+ClassGuid   = {4D36E967-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = UsbStorageGuard.cat
+DriverVer   = 11/06/2026,0.1.0.0
 
 [DestinationDirs]
-DriverCopy=12
+DefaultDestDir = 12
 
-[SourceDisksNames]
-1=%DiskName%
+[Manufacturer]
+%ProviderName% = USG, NTamd64
 
-[SourceDisksFiles]
-UsbStorageGuard.sys=1
+[USG.NTamd64]
+%USG.DeviceDesc% = USG_Install, USBSTOR\Disk
+
+[USG_Install.NT]
+AddReg = USG_AddReg
+
+[USG_Install.NT.Services]
+AddService = UsbStorageGuard, 0x00000002, USG_Service
+
+[USG_AddReg]
+HKR,,UpperFilters,0x00010000,"UsbStorageGuard"
+
+[USG_Service]
+DisplayName    = %USG.ServiceDesc%
+ServiceType    = 1
+StartType      = 0
+ErrorControl   = 1
+ServiceBinary  = %12%\UsbStorageGuard.sys
 
 [Strings]
-Provider="USB Storage Guard Advanced"
-DeviceDesc="USB Storage Guard Control Device (development)"
-ServiceName="USB Storage Guard Control Driver"
-DiskName="USB Storage Guard Driver Disk"
+ProviderName   = "Omar Yahya Silan"
+USG.DeviceDesc = "USB Storage Guard Advanced Filter"
+USG.ServiceDesc= "USB Storage Guard Advanced"
