@@ -1,102 +1,86 @@
+/* ============================================================
+ *  USB Storage Guard Advanced — Kernel Storage Filter
+ *  Author : Omar Yahya Silan (عمر يحي سيلان)
+ *  Status : Unsigned prototype — VM testing only
+ * ============================================================ */
+
 #include <ntddk.h>
 #include <wdf.h>
-#include <ntddstor.h>   // IOCTL_STORAGE_READ_CAPACITY
-#include <wdmsec.h>     // SDDL_DEVOBJ_SYS_ALL_ADM_ALL
+#include <ntddstor.h>
+#include <wdmsec.h>
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
 EVT_WDF_DEVICE_PREPARE_HARDWARE EvtDevicePrepareHardware;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
+EVT_WDF_IO_QUEUE_IO_DEFAULT EvtIoDefault;
 EVT_WDF_IO_IN_CALLER_CONTEXT EvtIoInCallerContext;
-EVT_WDF_REQUEST_COMPLETION_ROUTINE EvtCreateCompletion;
 
 #define IOCTL_USG_QUERY_STATE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS)
 #define IOCTL_USG_SET_POLICY  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 typedef struct _USG_POLICY {
-    ULONG Enabled;
-    ULONG Reserved;
+    ULONG     Enabled;
+    ULONG     Reserved;
     ULONGLONG MaxBytes;
 } USG_POLICY, *PUSG_POLICY;
 
 typedef struct _DEVICE_CONTEXT {
-    ULONGLONG DiskBytes;     // 0 = لم تُقرأ بعد
-    BOOLEAN   IsUsbStorage;  // هل الجهاز الحالي USBSTOR؟
-    BOOLEAN   Blocked;       // نتيجة القرار
+    ULONGLONG DiskBytes;
+    BOOLEAN   IsUsbStorage;
+    BOOLEAN   Blocked;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 
-static USG_POLICY  g_Policy = { 0, 0, 265000000000ULL }; // Enabled=0 افتراضياً
+static USG_POLICY  g_Policy = { 0, 0, 265000000000ULL };
 static WDFSPINLOCK g_PolicyLock;
-static WDFDEVICE   g_ControlDevice;
 
-/* ---------- قراءة سعة القرص عبر IOCTL_STORAGE_READ_CAPACITY ---------- */
-static NTSTATUS QueryDiskCapacity(WDFDEVICE Device, PULONGLONG Bytes)
-{
-    WDFIOTARGET target = WdfDeviceGetIoTarget(Device);
-    WDF_MEMORY_DESCRIPTOR outDesc;
-    STORAGE_READ_CAPACITY  cap = {0};
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outDesc, &cap, sizeof(cap));
-
-    NTSTATUS status = WdfIoTargetSendIoctlSynchronously(
-        target, NULL, IOCTL_STORAGE_READ_CAPACITY, NULL, &outDesc, NULL, NULL);
-
-    if (NT_SUCCESS(status)) {
-        *Bytes = (ULONGLONG)cap.DiskLength.QuadPart;
-    }
-    return status;
-}
-
-/* ---------- هل الجهاز الحالي تابع لفئة USBSTOR؟ ---------- */
 static BOOLEAN IsUsbStorDevice(WDFDEVICE Device)
 {
-    WDFDEVICE pdo = WdfDeviceWdmGetPhysicalDevice(Device);
     WCHAR buf[256] = {0};
-    UNICODE_STRING id;
-    id.Buffer = buf; id.MaximumLength = sizeof(buf); id.Length = 0;
-
-    // DeviceID لجهاز USBSTOR يبدأ بـ USBSTOR\Disk...
     if (NT_SUCCESS(IoGetDeviceProperty(
             WdfDeviceWdmGetPhysicalDevice(Device),
             DevicePropertyHardwareID, buf, sizeof(buf), NULL))) {
         return (wcsstr(buf, L"USBSTOR") != NULL);
     }
-    UNREFERENCED_PARAMETER(pdo); UNREFERENCED_PARAMETER(id);
     return FALSE;
 }
 
-/* ---------- EvtDevicePrepareHardware: نقطة قراءة السعة عند الإدراج ---------- */
+static NTSTATUS QueryDiskCapacity(WDFDEVICE Device, PULONGLONG Bytes)
+{
+    WDFIOTARGET target = WdfDeviceGetIoTarget(Device);
+    WDF_MEMORY_DESCRIPTOR outDesc;
+    STORAGE_READ_CAPACITY cap = {0};
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outDesc, &cap, sizeof(cap));
+    NTSTATUS status = WdfIoTargetSendIoctlSynchronously(
+        target, NULL, IOCTL_STORAGE_READ_CAPACITY, NULL, &outDesc, NULL, NULL);
+    if (NT_SUCCESS(status)) *Bytes = (ULONGLONG)cap.DiskLength.QuadPart;
+    return status;
+}
+
 NTSTATUS EvtDevicePrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESLIST Translated)
 {
     UNREFERENCED_PARAMETER(Raw); UNREFERENCED_PARAMETER(Translated);
     PDEVICE_CONTEXT ctx = GetDeviceContext(Device);
-    ctx->DiskBytes    = 0;
-    ctx->IsUsbStorage = IsUsbStorDevice(Device);
-    ctx->Blocked      = FALSE;
+    ctx->DiskBytes = 0; ctx->IsUsbStorage = FALSE; ctx->Blocked = FALSE;
 
-    if (ctx->IsUsbStorage) {
+    if (IsUsbStorDevice(Device)) {
+        ctx->IsUsbStorage = TRUE;
         ULONGLONG bytes = 0;
         if (NT_SUCCESS(QueryDiskCapacity(Device, &bytes))) {
             ctx->DiskBytes = bytes;
+            USG_POLICY p;
             WdfSpinLockAcquire(g_PolicyLock);
-            USG_POLICY p = g_Policy;
+            p = g_Policy;
             WdfSpinLockRelease(g_PolicyLock);
-
             if (p.Enabled && bytes > p.MaxBytes) {
                 ctx->Blocked = TRUE;
-                DbgPrint("[USG] USBSTOR blocked: %llu bytes > limit %llu\n", bytes, p.MaxBytes);
+                DbgPrint("[USG] Blocked USBSTOR: %llu > %llu\n", bytes, p.MaxBytes);
             }
         }
     }
     return STATUS_SUCCESS;
-}
-
-/* ---------- حظر IRP_MJ_CREATE على الجهاز المحظور ---------- */
-static VOID EvtCreateCompletion(WDFREQUEST Request, WDFIOTARGET Target, PWDF_REQUEST_COMPLETION_PARAMS Params, WDFCONTEXT Context)
-{
-    UNREFERENCED_PARAMETER(Target); UNREFERENCED_PARAMETER(Context);
-    WdfRequestComplete(Request, Params->IoStatus.Status);
 }
 
 static VOID EvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
@@ -106,7 +90,6 @@ static VOID EvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
     WDF_REQUEST_PARAMETERS_INIT(&params);
     WdfRequestGetParameters(Request, &params);
 
-    // إذا كان الجهاز محظوراً، ارفض أي فتح له
     if (params.Type == WdfRequestTypeCreate && ctx->Blocked) {
         WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
         return;
@@ -114,7 +97,13 @@ static VOID EvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request)
     WdfDeviceEnqueueRequest(Device, Request);
 }
 
-/* ---------- IOCTL على جهاز التحكم (الخدمة فقط) ---------- */
+static VOID EvtIoDefault(WDFQUEUE Queue, WDFREQUEST Request)
+{
+    WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    WdfRequestFormatRequestUsingCurrentType(Request);
+    WdfRequestSend(Request, WdfDeviceGetIoTarget(device), WDF_NO_SEND_OPTIONS);
+}
+
 static VOID EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     size_t OutLen, size_t InLen, ULONG IoControlCode)
 {
@@ -147,12 +136,17 @@ static VOID EvtIoDeviceControl(WDFQUEUE Queue, WDFREQUEST Request,
     WdfRequestCompleteWithInformation(Request, status, info);
 }
 
-/* ---------- EvtDeviceAdd: نُسجّل كمرشح، وننشئ جهاز تحكم منفصل ---------- */
 NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
 {
-    WdfFdoInitSetFilter(DeviceInit);            // ← هذا ما يجعله مرشحاً فعلياً
+    WdfFdoInitSetFilter(DeviceInit);
 
-    // جهاز التحكم (الواجهة الوحيدة لخدمة Windows)
+    WDF_PNPPOWER_EVENT_CALLBACKS pnp;
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
+    pnp.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
+    WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
+
+    WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, EvtIoInCallerContext);
+
     PWDFDEVICE_INIT ctrlInit = WdfControlDeviceInitAllocate(Driver, &SDDL_DEVOBJ_SYS_ALL_ADM_ALL);
     if (!ctrlInit) return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -177,29 +171,17 @@ NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     status = WdfIoQueueCreate(ctrl, &qc, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
     if (!NT_SUCCESS(status)) return status;
     WdfControlFinishInitializing(ctrl);
-    g_ControlDevice = ctrl;
 
-    // جهاز المرشح نفسه
     WDF_OBJECT_ATTRIBUTES devAttrs;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&devAttrs, DEVICE_CONTEXT);
     WDFDEVICE filterDevice;
     status = WdfDeviceCreate(&DeviceInit, &devAttrs, &filterDevice);
     if (!NT_SUCCESS(status)) return status;
 
-    WDF_PNPPOWER_EVENT_CALLBACKS pnp;
-    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
-    pnp.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
-    WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
-
-    // اعتراض CREATE قبل وصوله للسائق السفلي
     WDF_IO_QUEUE_CONFIG fqc;
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&fqc, WdfIoQueueDispatchSequential);
-    fqc.EvtIoDeviceControl = NULL;
-    status = WdfIoQueueCreate(filterDevice, &fqc, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
-    if (!NT_SUCCESS(status)) return status;
-
-    WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, EvtIoInCallerContext);
-    return STATUS_SUCCESS;
+    fqc.EvtIoDefault = EvtIoDefault;
+    return WdfIoQueueCreate(filterDevice, &fqc, WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
 }
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
