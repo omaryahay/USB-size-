@@ -1,10 +1,11 @@
+; USB Storage Guard Advanced — Author: Omar Yahya Silan
 [Version]
 Signature   = "$Windows NT$"
 Class       = DiskDrive
 ClassGuid   = {4D36E967-E325-11CE-BFC1-08002BE10318}
 Provider    = %ProviderName%
 CatalogFile = UsbStorageGuard.cat
-DriverVer   = 11/06/2026,0.1.0.0
+DriverVer   = 11/06/2026,0.2.0.0
 
 [DestinationDirs]
 DefaultDestDir = 12
@@ -32,6 +33,6 @@ ErrorControl   = 1
 ServiceBinary  = %12%\UsbStorageGuard.sys
 
 [Strings]
-ProviderName   = "Omar Yahya Silan"
-USG.DeviceDesc = "USB Storage Guard Advanced Filter"
-USG.ServiceDesc= "USB Storage Guard Advanced"
+ProviderName    = "Omar Yahya Silan"
+USG.DeviceDesc  = "USB Storage Guard Advanced Filter"
+USG.ServiceDesc = "USB Storage Guard Advanced"
