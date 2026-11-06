@@ -1,10 +1,98 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
-    <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>disable</Nullable>
-  </PropertyGroup>
-</Project>
+using System;
+using System.IO.Pipes;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.ServiceProcess;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
+
+namespace UsbStorageGuardService
+{
+    public class GuardService : ServiceBase
+    {
+        const string PipeName = "UsbStorageGuard.pipe";
+        const uint IOCTL_QUERY = 0x00222000; // CTL_CODE(FILE_DEVICE_UNKNOWN,0x800,METHOD_BUFFERED,FILE_READ_ACCESS)
+        const uint IOCTL_SET   = 0x00222004; // ...0x801...FILE_WRITE_ACCESS
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Policy { public uint Enabled; public uint Reserved; public ulong MaxBytes; }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFile(string name, uint access, uint share,
+            IntPtr sec, uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool DeviceIoControl(SafeFileHandle h, uint code,
+            ref Policy inBuf, int inSize, out Policy outBuf, int outSize,
+            out int returned, IntPtr overlapped);
+
+        public GuardService() { ServiceName = "UsbStorageGuard"; }
+
+        protected override void OnStart(string[] args) => StartPipeServer();
+
+        void StartPipeServer()
+        {
+            var ps = new PipeSecurity();
+            ps.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+            ps.AddAccessRule(new PipeAccessRule(
+                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                PipeAccessRights.FullControl, AccessControlType.Allow));
+            // لا صلاحيات للمستخدمين العاديين
+
+            var server = new NamedPipeServerStream(PipeName, PipeDirection.InOut,
+                1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 4096, 4096, ps);
+
+            server.WaitForConnectionAsync().ContinueWith(t =>
+            {
+                if (!t.IsFaulted)
+                {
+                    using var reader = new StreamReader(server, Encoding.UTF8);
+                    using var writer = new StreamWriter(server, Encoding.UTF8) { AutoFlush = true };
+                    string line = reader.ReadLine();
+                    writer.WriteLine(Handle(line));
+                }
+                server.Dispose();
+                StartPipeServer(); // أعد الاستماع
+            });
+        }
+
+        string Handle(string json)
+        {
+            try
+            {
+                var req = JsonSerializer.Deserialize<Request>(json);
+                using var h = CreateFile(@"\\.\UsbStorageGuard",
+                    0x40000000 /*GENERIC_WRITE*/ | 0x80000000 /*GENERIC_READ*/,
+                    0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                if (h.IsInvalid) return Error(Marshal.GetLastWin32Error());
+
+                if (req.Op == "get")
+                {
+                    if (!DeviceIoControl(h, IOCTL_QUERY, default, 0, out Policy p,
+                        Marshal.SizeOf<Policy>(), out _, IntPtr.Zero)) return Error(Marshal.GetLastWin32Error());
+                    return JsonSerializer.Serialize(p);
+                }
+                if (req.Op == "set")
+                {
+                    var p = new Policy { Enabled = req.Enabled, MaxBytes = req.MaxBytes };
+                    if (!DeviceIoControl(h, IOCTL_SET, ref p, Marshal.SizeOf<Policy>(),
+                        out _, 0, out _, IntPtr.Zero)) return Error(Marshal.GetLastWin32Error());
+                    return "OK";
+                }
+                return Error(87);
+            }
+            catch (Exception ex) { return Error(ex.HResult); }
+        }
+        static string Error(int code) => $"{{\"error\":{code}}}";
+        record Request(string Op, uint Enabled, ulong MaxBytes);
+    }
+
+    static class Program
+    {
+        static void Main() => ServiceBase.Run(new GuardService());
+    }
+}
