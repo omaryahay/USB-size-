@@ -1,33 +1,32 @@
+
 name: Build USB Storage Guard Advanced
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
 
 jobs:
   build-manager:
     runs-on: windows-2022
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: '8.0.x'
+
       - name: Build manager
-        run: dotnet publish Manager/UsbStorageGuardManager.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+        run: |
+          dotnet publish ./UsbStorageGuardManager.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o ./publish
+
       - name: Upload manager
         uses: actions/upload-artifact@v4
         with:
-          name: USB-Storage-Guard-Manager-Win64
-          path: publish/
-
-  driver-note:
-    runs-on: windows-2022
-    steps:
-      - name: Explain WDK requirement
-        run: |
-          Write-Host "Driver source is in Driver/."
-          Write-Host "A matching Windows Driver Kit (WDK) and driver-signing process are required."
-          Write-Host "This workflow does not compile or sign the kernel driver."
+          name: USB-Storage-Guard-Manager
+          path: publish/*.exe
+          if-no-files-found: error
