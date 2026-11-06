@@ -1,32 +1,58 @@
-
-name: Build USB Storage Guard Advanced
+name: Build USB Storage Guard
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+
+permissions:
+  contents: read
 
 jobs:
-  build-manager:
+  build:
     runs-on: windows-2022
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          dotnet-version: 8.0.x
+          cache: true
 
-      - name: Build manager
+      # ===== الواجهة =====
+      - name: Publish Manager
+        run: >
+          dotnet publish Manager/UsbStorageGuardManager.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o out/Manager
+
+      # ===== الخدمة =====
+      - name: Publish Service
+        run: >
+          dotnet publish Service/UsbStorageGuardService.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o out/Service
+
+      # ===== السائق (غير موقّع — للاختبار فقط) =====
+      - name: Install WDK
         run: |
-          dotnet publish ./UsbStorageGuardManager.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o ./publish
+          choco install windowsdriverkit10 --yes --no-progress
 
-      - name: Upload manager
-        uses: actions/upload-artifact@v4
+      - name: Build Driver
+        shell: pwsh
+        run: |
+          $wdk = "C:\Program Files (x86)\Windows Kits\10\build"
+          & msbuild Driver\UsbStorageGuard.vcxproj `
+            /p:Configuration=Release /p:Platform=x64 /p:SignMode=Off `
+            /p:WindowsTargetPlatformVersion=10.0.22621.0
+          Copy-Item Driver\x64\Release\UsbStorageGuard.sys out\Manager\ -Force -ErrorAction SilentlyContinue
+          Copy-Item Driver\UsbStorageGuard.inf out\Manager\ -Force -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: USB-Storage-Guard-Manager
-          path: publish/*.exe
-          if-no-files-found: error
+          name: USB-Storage-Guard-Win64
+          path: out/
